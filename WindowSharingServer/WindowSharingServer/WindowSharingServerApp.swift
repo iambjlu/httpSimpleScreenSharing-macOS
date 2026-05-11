@@ -129,13 +129,29 @@ final class CaptureManager: NSObject, ObservableObject, SCStreamOutput, SCStream
     }
 }
 
+// MARK: - Port utility
+
+private func pidsListening(on port: UInt16) -> [pid_t] {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    proc.arguments = ["-ti", ":\(port)", "-sTCP:LISTEN"]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError  = Pipe()
+    try? proc.run(); proc.waitUntilExit()
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return out.split(separator: "\n").compactMap { pid_t($0) }
+}
+
 // MARK: - WebSocket Server  (frames out, input events in)
 
 final class WebSocketServer: ObservableObject {
     @Published var isRunning   = false
     @Published var clientCount = 0
+    @Published var portError:  String?
+    @Published var blockedPIDs: [pid_t] = []
 
-    // CGEvent coordinates of the captured area
+    var inputEnabled  = true
     var captureBounds = CGRect(x: 0, y: 0, width: 1920, height: 1080)
 
     private var listener: NWListener?
@@ -144,6 +160,7 @@ final class WebSocketServer: ObservableObject {
     private let queue = DispatchQueue(label: "ws", qos: .userInteractive)
 
     func start(port: UInt16) {
+        portError = nil; blockedPIDs = []
         let params  = NWParameters.tcp
         let wsOpts  = NWProtocolWebSocket.Options()
         wsOpts.autoReplyPing = true
@@ -154,7 +171,18 @@ final class WebSocketServer: ObservableObject {
         listener = l
         l.newConnectionHandler = { [weak self] c in self?.accept(c) }
         l.stateUpdateHandler   = { [weak self] s in
-            DispatchQueue.main.async { self?.isRunning = (s == .ready) }
+            DispatchQueue.main.async {
+                switch s {
+                case .ready:
+                    self?.isRunning = true; self?.portError = nil; self?.blockedPIDs = []
+                case .failed:
+                    self?.isRunning = false
+                    let pids = pidsListening(on: port)
+                    self?.portError  = "WS port \(port) 已被佔用"
+                    self?.blockedPIDs = pids
+                default: break
+                }
+            }
         }
         l.start(queue: queue)
     }
@@ -163,7 +191,7 @@ final class WebSocketServer: ObservableObject {
         listener?.cancel(); listener = nil
         lock.lock(); let all = clients; clients.removeAll(); lock.unlock()
         all.values.forEach { $0.cancel() }
-        DispatchQueue.main.async { self.isRunning = false; self.clientCount = 0 }
+        DispatchQueue.main.async { self.isRunning = false; self.clientCount = 0; self.portError = nil; self.blockedPIDs = [] }
     }
 
     func broadcast(_ jpeg: Data) {
@@ -211,7 +239,7 @@ final class WebSocketServer: ObservableObject {
     // MARK: Input injection
 
     private func handleInput(_ json: [String: Any]) {
-        guard let type = json["type"] as? String else { return }
+        guard inputEnabled, let type = json["type"] as? String else { return }
         let b = captureBounds
 
         switch type {
@@ -284,7 +312,9 @@ final class WebSocketServer: ObservableObject {
 // MARK: - HTTP Server  (serves the viewer HTML)
 
 final class HTTPServer: ObservableObject {
-    @Published var isRunning = false
+    @Published var isRunning  = false
+    @Published var portError:  String?
+    @Published var blockedPIDs: [pid_t] = []
 
     private var listener: NWListener?
     private var connections: [NWConnection] = []
@@ -293,13 +323,25 @@ final class HTTPServer: ObservableObject {
 
     func start(port: UInt16, wsPort: UInt16) {
         self.wsPort = wsPort
+        portError = nil; blockedPIDs = []
         guard !isRunning else { return }
         guard let l = try? NWListener(using: .tcp,
                                        on: NWEndpoint.Port(rawValue: port)!) else { return }
         listener = l
         l.newConnectionHandler = { [weak self] c in self?.setup(c) }
         l.stateUpdateHandler   = { [weak self] s in
-            DispatchQueue.main.async { self?.isRunning = (s == .ready) }
+            DispatchQueue.main.async {
+                switch s {
+                case .ready:
+                    self?.isRunning = true; self?.portError = nil; self?.blockedPIDs = []
+                case .failed:
+                    self?.isRunning = false
+                    let pids = pidsListening(on: port)
+                    self?.portError   = "HTTP port \(port) 已被佔用"
+                    self?.blockedPIDs = pids
+                default: break
+                }
+            }
         }
         l.start(queue: queue)
     }
@@ -343,19 +385,33 @@ final class HTTPServer: ObservableObject {
         *{margin:0;padding:0;box-sizing:border-box}
         html,body{width:100%;height:100%;background:#000;overflow:hidden;display:flex;align-items:center;justify-content:center}
         canvas{display:block;cursor:default;image-rendering:auto}
-        #hud{position:fixed;top:6px;left:6px;color:#0f0;font:11px/1.4 monospace;background:rgba(0,0,0,.55);padding:3px 7px;border-radius:4px;pointer-events:none;user-select:none;-webkit-user-select:none}
-        #fs-btn{position:fixed;top:6px;right:6px;color:#fff;font:11px monospace;background:rgba(0,0,0,.55);padding:3px 8px;border-radius:4px;cursor:pointer;border:1px solid rgba(255,255,255,.2)}
-        #fs-btn:hover{background:rgba(255,255,255,.15)}
+        #corner{position:fixed;bottom:10px;right:10px;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.15);border-radius:6px;padding:4px 8px;user-select:none;-webkit-user-select:none}
+        #fps{color:#fff;font:bold 13px/1 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-width:2ch;text-align:right}
+        #fs-btn{color:#fff;width:18px;height:18px;cursor:pointer;opacity:.8;background:none;border:none;padding:0;display:flex;align-items:center;justify-content:center}
+        #fs-btn:hover{opacity:1}
+        #reload-btn{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);display:none;flex-direction:column;align-items:center;gap:8px;cursor:pointer;background:rgba(0,0,0,.55);border:1px solid rgba(255,255,255,.2);border-radius:12px;padding:18px 24px;color:#fff}
+        #reload-btn svg{width:40px;height:40px;opacity:.9}
+        #reload-btn span{font:12px/1 sans-serif;opacity:.7}
+        #reload-btn:hover svg{opacity:1}
         </style>
         </head>
         <body>
         <canvas id="c" tabindex="0"></canvas>
-        <div id="hud">connecting…</div>
-        <div id="fs-btn" onclick="toggleFullscreen()">⛶ 全螢幕</div>
+        <div id="corner">
+          <span id="fps">–</span>
+          <button id="fs-btn" onclick="toggleFullscreen()" title="全螢幕"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
+        </div>
+        <div id="reload-btn" onclick="location.reload()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/>
+          </svg>
+          <span>重新連線</span>
+        </div>
         <script>
-        const canvas = document.getElementById('c');
-        const ctx    = canvas.getContext('2d');
-        const hud    = document.getElementById('hud');
+        const canvas    = document.getElementById('c');
+        const ctx       = canvas.getContext('2d');
+        const fpsEl     = document.getElementById('fps');
+        const reloadBtn = document.getElementById('reload-btn');
         canvas.focus();
 
         const ws = new WebSocket('ws://' + location.hostname + ':\(wsPort)');
@@ -363,11 +419,11 @@ final class HTTPServer: ObservableObject {
 
         let currentBmp = null, nextBmp = null;
         let frameW = 0, frameH = 0;
-        let frames = 0, lastFpsTs = performance.now(), fps = 0;
+        let frames = 0, lastFpsTs = performance.now();
 
-        ws.onopen  = () => { hud.textContent = '0 fps | connected'; };
-        ws.onclose = () => { hud.textContent = 'disconnected – reload to reconnect'; };
-        ws.onerror = () => { hud.textContent = 'WebSocket error'; };
+        ws.onopen  = () => { reloadBtn.style.display = 'none'; };
+        ws.onclose = () => { reloadBtn.style.display = 'flex'; fpsEl.textContent = '–'; };
+        ws.onerror = () => { reloadBtn.style.display = 'flex'; fpsEl.textContent = '–'; };
 
         ws.onmessage = e => {
             if (!(e.data instanceof ArrayBuffer)) return;
@@ -377,9 +433,8 @@ final class HTTPServer: ObservableObject {
                 frames++;
                 const now = performance.now();
                 if (now - lastFpsTs >= 1000) {
-                    fps = Math.round(frames * 1000 / (now - lastFpsTs));
+                    fpsEl.textContent = Math.round(frames * 1000 / (now - lastFpsTs));
                     frames = 0; lastFpsTs = now;
-                    hud.textContent = fps + ' fps | connected';
                 }
             });
         };
@@ -451,9 +506,11 @@ final class HTTPServer: ObservableObject {
                 document.exitFullscreen();
             }
         }
+        const svgEnter = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>';
+        const svgExit  = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/></svg>';
         document.addEventListener('fullscreenchange', () => {
             const btn = document.getElementById('fs-btn');
-            btn.textContent = document.fullscreenElement ? '✕ 離開全螢幕' : '⛶ 全螢幕';
+            btn.innerHTML = document.fullscreenElement ? svgExit : svgEnter;
         });
         // F11 also toggles fullscreen
         // (handled below in keydown — we intercept before sending to server)
@@ -491,6 +548,7 @@ struct ContentView: View {
     @State private var httpPortText          = "8080"
     @State private var status                = "就緒"
     @State private var needsScreenPermission = false
+    @State private var inputEnabled          = true
 
     private var httpPort: UInt16 { UInt16(httpPortText) ?? 8080 }
     private var wsPort:   UInt16 { httpPort + 1 }
@@ -533,8 +591,11 @@ struct ContentView: View {
             }
 
             HStack(spacing: 12) {
-                Button("重新整理列表") { Task { await loadContent() } }
                 Toggle("全螢幕模式", isOn: $useDisplay)
+                Divider().frame(height: 18)
+                Toggle("遠端操作", isOn: $inputEnabled)
+                    .disabled(!useDisplay)
+                    .help(useDisplay ? "允許客戶端控制滑鼠與鍵盤" : "視窗模式不支援遠端操作")
                 Spacer()
                 Circle()
                     .fill(wsServer.clientCount > 0 ? Color.green : Color.gray)
@@ -542,6 +603,8 @@ struct ContentView: View {
                 Text("客戶端：\(wsServer.clientCount)")
                     .foregroundColor(wsServer.clientCount > 0 ? .green : .secondary)
             }
+            .onChange(of: inputEnabled)  { wsServer.inputEnabled = $0 }
+            .onChange(of: useDisplay)    { if !$0 { inputEnabled = false } }
 
             // Server controls
             HStack(spacing: 12) {
@@ -570,6 +633,29 @@ struct ContentView: View {
                     }
                     .buttonStyle(.link)
                 }
+            }
+
+            // Port error banner
+            let portErr = httpServer.portError ?? wsServer.portError
+            let portPIDs = httpServer.blockedPIDs.isEmpty ? wsServer.blockedPIDs : httpServer.blockedPIDs
+            if let err = portErr {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
+                    Text(err).foregroundColor(.red)
+                    if !portPIDs.isEmpty {
+                        Button("強制關閉佔用進程") {
+                            portPIDs.forEach { kill($0, SIGTERM) }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                httpServer.start(port: httpPort, wsPort: wsPort)
+                                wsServer.start(port: wsPort)
+                            }
+                        }
+                        .buttonStyle(.borderedProminent).tint(.red)
+                    }
+                }
+                .padding(8)
+                .background(Color.red.opacity(0.1))
+                .cornerRadius(8)
             }
 
             if httpServer.isRunning {
@@ -630,10 +716,10 @@ struct ContentView: View {
         .frame(minWidth: 720, minHeight: 560)
         .task {
             await loadContent()
-            // Wire capture frames → WebSocket broadcast
-            capture.onFrame = { [weak wsServer] jpeg in
-                wsServer?.broadcast(jpeg)
-            }
+            capture.onFrame = { [weak wsServer] jpeg in wsServer?.broadcast(jpeg) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await loadContent() }
         }
         .onChange(of: useDisplay,      perform: { _ in updateBounds() })
         .onChange(of: selectedDisplay, perform: { _ in updateBounds() })

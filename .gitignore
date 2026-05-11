@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+
+# Build output
+WindowSharingClient/publish/
+WindowSharingClient/obj/
