@@ -5,5 +5,13 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="FFmpeg.AutoGen" Version="6.1.1" />
+  </ItemGroup>
+  <!-- Bundle FFmpeg DLLs from ffmpeg-dlls/ subfolder next to .csproj -->
+  <ItemGroup>
+    <None Include="ffmpeg-dlls\*.dll" CopyToOutputDirectory="Always"/>
+  </ItemGroup>
 </Project>

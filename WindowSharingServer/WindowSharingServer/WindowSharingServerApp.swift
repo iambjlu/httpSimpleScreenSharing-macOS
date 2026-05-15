@@ -1,3 +1,4 @@
+
 import SwiftUI
 import ScreenCaptureKit
 import Network
@@ -6,6 +7,7 @@ import AppKit
 import CoreImage
 import Foundation
 import Combine
+import VideoToolbox
 
 // MARK: - App
 
@@ -52,27 +54,53 @@ final class CaptureManager: NSObject, ObservableObject, SCStreamOutput, SCStream
     @Published var latestImage: NSImage?
     @Published var isCapturing = false
 
-    var onFrame: ((Data) -> Void)?
+    var onJpegFrame: ((Data) -> Void)?
+    var onH264Frame: ((Data) -> Void)?
+
+    // Adjustable by client messages (accessed from capture queue + ws queue — benign race on value types)
+    var jpegQuality: Double = 0.75
+    var limitTo1080p: Bool  = false
+    var encodeH264:   Bool  = false {
+        didSet {
+            if encodeH264 { h264Encoder.setup(width: captureWidth, height: captureHeight) }
+            else           { h264Encoder.teardown() }
+        }
+    }
 
     private var stream: SCStream?
     private let captureQueue = DispatchQueue(label: "capture", qos: .userInteractive)
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false,
                                                .cacheIntermediates: false])
+    let h264Encoder = H264Encoder()
+    private var captureWidth  = 1920
+    private var captureHeight = 1080
     private var lastUIUpdate = Date.distantPast
+    private var storedDisplay: SCDisplay?
+    private var storedWindow:  SCWindow?
 
     func start(display: SCDisplay, fps: Int) throws {
+        storedDisplay = display; storedWindow = nil
+        captureWidth  = Int(display.width); captureHeight = Int(display.height)
+        if encodeH264 { h264Encoder.setup(width: captureWidth, height: captureHeight) }
         stop()
         let filter = SCContentFilter(display: display, excludingWindows: [])
-        let cfg = makeConfig(width: Int(display.width), height: Int(display.height), fps: fps)
+        let cfg = makeConfig(width: captureWidth, height: captureHeight, fps: fps)
         try launch(filter: filter, config: cfg)
     }
 
     func start(window: SCWindow, fps: Int) throws {
+        storedDisplay = nil; storedWindow = window
+        captureWidth  = Int(window.frame.width); captureHeight = Int(window.frame.height)
+        if encodeH264 { h264Encoder.setup(width: captureWidth, height: captureHeight) }
         stop()
         let filter = SCContentFilter(desktopIndependentWindow: window)
-        let cfg = makeConfig(width: Int(window.frame.width),
-                             height: Int(window.frame.height), fps: fps)
+        let cfg = makeConfig(width: captureWidth, height: captureHeight, fps: fps)
         try launch(filter: filter, config: cfg)
+    }
+
+    func restartWithFps(_ fps: Int) {
+        if let d = storedDisplay { try? start(display: d, fps: fps) }
+        else if let w = storedWindow { try? start(window: w, fps: fps) }
     }
 
     private func makeConfig(width: Int, height: Int, fps: Int) -> SCStreamConfiguration {
@@ -96,6 +124,7 @@ final class CaptureManager: NSObject, ObservableObject, SCStreamOutput, SCStream
     func stop() {
         let s = stream; stream = nil
         Task { try? await s?.stopCapture() }
+        h264Encoder.teardown()
         DispatchQueue.main.async { self.isCapturing = false }
     }
 
@@ -106,13 +135,26 @@ final class CaptureManager: NSObject, ObservableObject, SCStreamOutput, SCStream
         guard type == .screen,
               let pb = CMSampleBufferGetImageBuffer(buf) else { return }
 
-        let ci = CIImage(cvPixelBuffer: pb)
+        // H264 path — encode raw pixel buffer (no 1080p limit; bitrate handles bandwidth)
+        if encodeH264 {
+            h264Encoder.encode(pb, pts: CMSampleBufferGetPresentationTimeStamp(buf))
+        }
+
+        // JPEG path — always runs (web viewer + SwiftUI preview)
+        var ci = CIImage(cvPixelBuffer: pb)
+
+        if limitTo1080p && ci.extent.height > 1080 {
+            let scale = 1080.0 / ci.extent.height
+            ci = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        }
+
         guard let cg = ciContext.createCGImage(ci, from: ci.extent) else { return }
 
         let rep = NSBitmapImageRep(cgImage: cg)
-        guard let jpeg = rep.representation(using: .jpeg,
-                                            properties: [.compressionFactor: 0.75]) else { return }
-        onFrame?(jpeg)
+        if let jpeg = rep.representation(using: .jpeg,
+                                         properties: [.compressionFactor: jpegQuality]) {
+            onJpegFrame?(jpeg)
+        }
 
         // Throttle the small SwiftUI preview to ~10 fps
         let now = Date()
@@ -127,6 +169,97 @@ final class CaptureManager: NSObject, ObservableObject, SCStreamOutput, SCStream
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         DispatchQueue.main.async { self.isCapturing = false }
     }
+}
+
+// MARK: - H.264 Encoder (VideoToolbox)
+
+final class H264Encoder {
+    var onEncodedData: ((Data) -> Void)?
+    private var session: VTCompressionSession?
+
+    func setup(width: Int, height: Int) {
+        teardown()
+        var s: VTCompressionSession?
+        let st = VTCompressionSessionCreate(
+            allocator: nil, width: Int32(width), height: Int32(height),
+            codecType: kCMVideoCodecType_H264,
+            encoderSpecification: nil, imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: vtOutputCallback,
+            refcon: Unmanaged.passUnretained(self).toOpaque(),
+            compressionSessionOut: &s)
+        guard st == noErr, let s else { return }
+        session = s
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_RealTime,             value: kCFBooleanTrue)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel,
+                             value: kVTProfileLevel_H264_High_AutoLevel)
+        let bps = 4_000_000 as CFNumber
+        VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: bps)
+        VTCompressionSessionPrepareToEncodeFrames(s)
+    }
+
+    func encode(_ pb: CVPixelBuffer, pts: CMTime) {
+        guard let s = session else { return }
+        VTCompressionSessionEncodeFrame(s, imageBuffer: pb,
+                                         presentationTimeStamp: pts, duration: .invalid,
+                                         frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: nil)
+    }
+
+    func teardown() {
+        if let s = session { VTCompressionSessionInvalidate(s); session = nil }
+    }
+
+    fileprivate func handleOutput(_ sb: CMSampleBuffer) {
+        guard let data = annexB(from: sb) else { return }
+        onEncodedData?(data)
+    }
+
+    private func annexB(from sb: CMSampleBuffer) -> Data? {
+        guard let block = CMSampleBufferGetDataBuffer(sb) else { return nil }
+        let cfArr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
+        let isKey: Bool
+        if let cfArr, let arr = cfArr as? [[CFString: Any]], let first = arr.first {
+            isKey = first[kCMSampleAttachmentKey_NotSync] as? Bool != true
+        } else { isKey = true }
+
+        let sc: [UInt8] = [0, 0, 0, 1]
+        var out = Data()
+
+        if isKey, let fmt = CMSampleBufferGetFormatDescription(sb) {
+            var n = 0
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                fmt, parameterSetIndex: 0, parameterSetPointerOut: nil,
+                parameterSetSizeOut: nil, parameterSetCountOut: &n, nalUnitHeaderLengthOut: nil)
+            for i in 0..<n {
+                var p: UnsafePointer<UInt8>?; var pLen = 0
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    fmt, parameterSetIndex: i, parameterSetPointerOut: &p,
+                    parameterSetSizeOut: &pLen, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                if let p { out.append(contentsOf: sc); out.append(p, count: pLen) }
+            }
+        }
+
+        var total = 0
+        CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                    totalLengthOut: &total, dataPointerOut: nil)
+        var raw = [UInt8](repeating: 0, count: total)
+        CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: total, destination: &raw)
+        var o = 0
+        while o + 4 <= total {
+            let len = Int(raw[o]) << 24 | Int(raw[o+1]) << 16 | Int(raw[o+2]) << 8 | Int(raw[o+3])
+            o += 4
+            guard len > 0, o + len <= total else { break }
+            out.append(contentsOf: sc); out.append(contentsOf: raw[o..<o+len])
+            o += len
+        }
+        return out.isEmpty ? nil : out
+    }
+}
+
+private let vtOutputCallback: VTCompressionOutputCallback = { ref, _, status, _, sb in
+    guard status == noErr, let sb, let ref else { return }
+    Unmanaged<H264Encoder>.fromOpaque(ref).takeUnretainedValue().handleOutput(sb)
 }
 
 // MARK: - Port utility
@@ -151,11 +284,13 @@ final class WebSocketServer: ObservableObject {
     @Published var portError:  String?
     @Published var blockedPIDs: [pid_t] = []
 
-    var inputEnabled  = true
-    var captureBounds = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    var inputEnabled   = true
+    var captureBounds  = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+    weak var captureManager: CaptureManager?
 
     private var listener: NWListener?
-    private var clients: [ObjectIdentifier: NWConnection] = [:]
+    private var clients:     [ObjectIdentifier: NWConnection] = [:]
+    private var h264Clients: Set<ObjectIdentifier> = []         // connections that negotiated H264
     private let lock  = NSLock()
     private let queue = DispatchQueue(label: "ws", qos: .userInteractive)
 
@@ -189,18 +324,29 @@ final class WebSocketServer: ObservableObject {
 
     func stop() {
         listener?.cancel(); listener = nil
-        lock.lock(); let all = clients; clients.removeAll(); lock.unlock()
+        lock.lock(); let all = clients; clients.removeAll(); h264Clients.removeAll(); lock.unlock()
         all.values.forEach { $0.cancel() }
         DispatchQueue.main.async { self.isRunning = false; self.clientCount = 0; self.portError = nil; self.blockedPIDs = [] }
     }
 
-    func broadcast(_ jpeg: Data) {
+    func broadcastJpeg(_ jpeg: Data) {
         let meta = NWProtocolWebSocket.Metadata(opcode: .binary)
         let ctx  = NWConnection.ContentContext(identifier: "f", metadata: [meta])
-        lock.lock(); let conns = Array(clients.values); lock.unlock()
+        lock.lock(); let conns = clients.filter { !h264Clients.contains($0.key) }.map(\.value); lock.unlock()
         for c in conns {
-            c.send(content: jpeg, contentContext: ctx, isComplete: true,
-                   completion: .idempotent)
+            c.send(content: jpeg, contentContext: ctx, isComplete: true, completion: .idempotent)
+        }
+    }
+
+    func broadcastH264(_ annexB: Data) {
+        guard !h264Clients.isEmpty else { return }
+        // 1-byte prefix 0x48 ('H') + Annex B payload
+        var frame = Data([0x48]); frame.append(annexB)
+        let meta = NWProtocolWebSocket.Metadata(opcode: .binary)
+        let ctx  = NWConnection.ContentContext(identifier: "h", metadata: [meta])
+        lock.lock(); let conns = clients.filter { h264Clients.contains($0.key) }.map(\.value); lock.unlock()
+        for c in conns {
+            c.send(content: frame, contentContext: ctx, isComplete: true, completion: .idempotent)
         }
     }
 
@@ -213,16 +359,21 @@ final class WebSocketServer: ObservableObject {
             guard let self else { return }
             switch state {
             case .failed, .cancelled:
-                self.lock.lock(); self.clients.removeValue(forKey: id); self.lock.unlock()
+                self.lock.lock()
+                self.clients.removeValue(forKey: id)
+                self.h264Clients.remove(id)
+                let anyH264 = !self.h264Clients.isEmpty
+                self.lock.unlock()
+                if !anyH264 { self.captureManager?.encodeH264 = false }
                 DispatchQueue.main.async { self.clientCount = self.clients.count }
             default: break
             }
         }
-        recv(connection)
+        recv(connection, id: id)
         connection.start(queue: queue)
     }
 
-    private func recv(_ connection: NWConnection) {
+    private func recv(_ connection: NWConnection, id: ObjectIdentifier) {
         connection.receiveMessage { [weak self] data, ctx, _, error in
             guard let self, error == nil else { return }
             if let data, !data.isEmpty,
@@ -230,16 +381,56 @@ final class WebSocketServer: ObservableObject {
                    definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata,
                meta.opcode == .text,
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                self.handleInput(json)
+                self.handleInput(json, from: id, connection: connection)
             }
-            self.recv(connection)
+            self.recv(connection, id: id)
         }
     }
 
     // MARK: Input injection
 
-    private func handleInput(_ json: [String: Any]) {
-        guard inputEnabled, let type = json["type"] as? String else { return }
+    private func handleInput(_ json: [String: Any], from id: ObjectIdentifier, connection: NWConnection) {
+        guard let type = json["type"] as? String else { return }
+
+        // Settings messages — handle regardless of inputEnabled
+        switch type {
+        case "hello":
+            let codecs = json["codecs"] as? [String] ?? []
+            if codecs.contains("h264") {
+                lock.lock(); h264Clients.insert(id); lock.unlock()
+                captureManager?.encodeH264 = true
+                let resp = #"{"type":"codec","codec":"h264"}"#
+                let meta = NWProtocolWebSocket.Metadata(opcode: .text)
+                let ctx  = NWConnection.ContentContext(identifier: "r", metadata: [meta])
+                connection.send(content: Data(resp.utf8), contentContext: ctx,
+                                isComplete: true, completion: .idempotent)
+            } else {
+                let resp = #"{"type":"codec","codec":"jpeg"}"#
+                let meta = NWProtocolWebSocket.Metadata(opcode: .text)
+                let ctx  = NWConnection.ContentContext(identifier: "r", metadata: [meta])
+                connection.send(content: Data(resp.utf8), contentContext: ctx,
+                                isComplete: true, completion: .idempotent)
+            }
+            return
+        case "setQuality":
+            if let q = json["quality"] as? Int {
+                captureManager?.jpegQuality = Double(q) / 100.0
+            }
+            return
+        case "setFps":
+            if let fps = json["fps"] as? Int {
+                captureManager?.restartWithFps(fps)
+            }
+            return
+        case "setMaxResolution":
+            if let limit = json["limit1080p"] as? Bool {
+                captureManager?.limitTo1080p = limit
+            }
+            return
+        default: break
+        }
+
+        guard inputEnabled else { return }
         let b = captureBounds
 
         switch type {
@@ -294,7 +485,13 @@ final class WebSocketServer: ObservableObject {
             if json["meta"]  as? Bool == true { flags.insert(.maskCommand) }
             let ev = CGEvent(keyboardEventSource: nil,
                              virtualKey: keyCode, keyDown: isDown)
-            ev?.flags = flags
+            // CapsLock (kVK_CapsLock = 57) requires maskAlphaShift on keyDown
+            // for macOS to actually toggle the caps-lock state via CGEvent.
+            if keyCode == 57 {
+                ev?.flags = isDown ? [.maskAlphaShift] : []
+            } else {
+                ev?.flags = flags
+            }
             ev?.post(tap: .cghidEventTap)
 
         default: break
@@ -716,7 +913,10 @@ struct ContentView: View {
         .frame(minWidth: 720, minHeight: 560)
         .task {
             await loadContent()
-            capture.onFrame = { [weak wsServer] jpeg in wsServer?.broadcast(jpeg) }
+            capture.onJpegFrame = { [weak wsServer] jpeg in wsServer?.broadcastJpeg(jpeg) }
+            capture.onH264Frame = { [weak wsServer] h264 in wsServer?.broadcastH264(h264) }
+            capture.h264Encoder.onEncodedData = { [weak capture] data in capture?.onH264Frame?(data) }
+            wsServer.captureManager = capture
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await loadContent() }
